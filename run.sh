@@ -9,7 +9,7 @@
 # Env: FREQ=915e6 TX_GAIN=50 RX_GAIN=20 PORT=18096 LOOP=1 START=0 VIDEO=/path.mp4
 #   LOOP=0 -> keep streaming until Ctrl-C
 #   DURATION=60 -> seconds to run in cam mode
-#   VIDEO unset -> a synthetic 30 s source is generated (no camera needed)
+#   cam: VIDEO streams that file at 1x; without VIDEO it uses testsrc2 (no camera needed)
 set -euo pipefail
 cd "$(dirname "$0")"
 

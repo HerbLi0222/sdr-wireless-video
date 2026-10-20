@@ -525,7 +525,7 @@ def run_pipe(a):
     lock = threading.Lock()
     eof = threading.Event()
     stats = {"in": 0, "out": 0, "sent": 0, "dropped": 0}
-    max_backlog = 500 * PAYLOAD         # ~45 kB ~ 1.8 s of stream; drop oldest beyond
+    max_backlog = 500 * PAYLOAD         # ~188 kB ~ 4 s; large enough for I-frame bursts
 
     def reader():
         while True:
