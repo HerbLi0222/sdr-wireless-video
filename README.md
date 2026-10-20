@@ -119,6 +119,45 @@ Latency budget: encoder ~50 ms (x264 veryfast, zerolatency) + TX backlog (up to
 (That screenshot is the QPSK/300 kbps path; `docs/vlc-live-pipeline.png` shows
 the earlier BPSK/100 kbps run.)
 
+## Cutting the required bandwidth
+
+The RF channel follows the *source* bitrate: fewer bits/s → fewer symbols/s →
+narrower spectrum. Two knobs were added:
+
+```bash
+VCODEC=libx265 VBITRATE=300k SDR_FS=500000 ./run.sh cam   # half the spectrum
+```
+
+`SDR_FS` sets the sample rate (1 MSps default), which directly sets the occupied
+bandwidth. Measured 99 % occupied bandwidth: **0.845 MHz @ 1 MSps → 0.423 MHz @
+0.5 MSps**.
+
+Codec comparison on this content (640x360, 20 fps, 15 s, PSNR vs a CRF-12
+mezzanine):
+
+| codec | bitrate | PSNR |
+|---|---|---|
+| x264 veryfast | 266 kbps | 42.5 dB |
+| x264 veryfast | 457 kbps | 46.3 dB |
+| x265 fast | 284 kbps | 46.0 dB |
+| x265 fast | 493 kbps | 49.4 dB |
+| SVT-AV1 preset 8 | 287 kbps | 48.7 dB |
+| SVT-AV1 preset 8 | 489 kbps | 50.8 dB |
+
+So at equal quality (~46 dB) x264 needs ~450 kbps while x265 needs ~290 and AV1
+~250 — a **35–45 % bitrate saving**, which buys a proportionally narrower
+channel. Live test at half bandwidth:
+
+```bash
+SDR_FS=500000 VCODEC=libx265 VBITRATE=300k VIDEO=/tmp/full360.mp4 ./run.sh cam
+live: in 1837512 B, out 1828112 B, frames 4887, dropped 0, 39.8 s -> 46.0 kB/s
+```
+
+99.5 % delivered at 46 kB/s in **0.423 MHz** instead of 0.845 MHz.
+
+Caveat: AV1's normal mode has a 1–2 s lookahead (latency); x265 with
+`rc-lookahead=20` is the realtime compromise used above.
+
 ## Parameters
 
 | item | value |

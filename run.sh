@@ -9,6 +9,7 @@
 # Env: FREQ=915e6 TX_GAIN=50 RX_GAIN=20 PORT=18096 LOOP=1 START=0 VIDEO=/path.mp4
 #   LOOP=0 -> keep streaming until Ctrl-C
 #   DURATION=0  -> cam streams the whole input; >0 caps it
+#   VCODEC=libx265 VBITRATE=300k SDR_FS=500000 -> same quality, half the RF bandwidth
 #   cam: VIDEO streams that file at 1x; without VIDEO it uses testsrc2 (no camera needed)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -70,13 +71,20 @@ if [ "$MODE" = "cam" ]; then
   VLC_PID=$!
   sleep 2
   if [ -n "$VIDEO" ] && [ -f "$VIDEO" ]; then
-    say "3. live pipeline: $VIDEO (played at 1x) -> x264 -> B210 -> UDP -> VLC"
+    say "3. live pipeline: $VIDEO (1x, $VCODEC ${VBITRATE}) -> B210 -> UDP -> VLC"
     SRC=(-re -ss "$START" -i "$VIDEO")
     VF=(-vf "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2")
   else
-    say "3. live pipeline: synthetic camera (testsrc2) -> x264 -> B210 -> UDP -> VLC"
+    say "3. live pipeline: synthetic camera ($VCODEC ${VBITRATE}) -> B210 -> UDP -> VLC"
     SRC=(-re -f lavfi -i "testsrc2=size=640x360:rate=20" -f lavfi -i "sine=frequency=800:sample_rate=48000")
     VF=()
+  fi
+  VCODEC="${VCODEC:-libx264}"
+  VBITRATE="${VBITRATE:-600k}"
+  if [ "$VCODEC" = "libx265" ]; then
+    VOPT=(-c:v libx265 -preset fast -x265-params "rc-lookahead=20:bframes=0:log-level=error" -b:v "$VBITRATE")
+  else
+    VOPT=(-c:v libx264 -profile:v baseline -preset veryfast -tune zerolatency -b:v "$VBITRATE" -maxrate "$VBITRATE")
   fi
   TLIM=()
   DUR_ARG=()
@@ -85,8 +93,7 @@ if [ "$MODE" = "cam" ]; then
     DUR_ARG=(--duration "$(( DURATION + 15 ))")
   fi
   ffmpeg -hide_banner -loglevel error "${SRC[@]}" "${TLIM[@]}" "${VF[@]}" \
-    -c:v libx264 -profile:v baseline -preset veryfast -tune zerolatency \
-    -b:v 600k -maxrate 700k -bufsize 1200k -g 20 -keyint_min 20 -sc_threshold 0 \
+    ${VOPT[@]} -g 20 -keyint_min 20 -sc_threshold 0 \
     -c:a aac -b:a 48k -ac 2 -f mpegts - \
   | python3 sdr_link.py pipe --udp-port "$PORT" "${DUR_ARG[@]}" \
       --freq "$FREQ" --tx-gain "$TX_GAIN" --rx-gain "$RX_GAIN"

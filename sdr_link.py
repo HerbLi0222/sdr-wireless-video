@@ -26,7 +26,7 @@ import sys
 import numpy as np
 import uhd
 
-FS = 1_000_000
+FS = int(os.environ.get("SDR_FS", "1000000"))   # sample rate -> RF bandwidth
 SPB = 2                  # samples per symbol: 500 ksym/s -> 0.47 Mbps
 PRE_LEN = 255
 PAYLOAD = 376            # 2 TS packets
