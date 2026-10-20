@@ -71,14 +71,25 @@ frames them as they arrive and transmits immediately; the receiver demodulates i
 live: in 927592 B, out 912928 B, frames 2434, dropped 33, 38.3 s -> 23.8 kB/s
 ```
 
-QPSK run at 300 kbps + 32 kbps: 1,990,168 of 2,036,416 B (97.7 %) delivered at
-**52.0 kB/s**; the short GOP (10 frames) means a lost frame heals within 0.5 s.
+`cam` now runs 640×360 @ 600 kbps + 48 kbps audio. Measured over 38 s:
+
+```
+live: in 3642124 B, out 3634040 B, frames 9686, dropped 0, 38.3 s -> 94.9 kB/s
+```
+
+**99.8 %** delivered, zero backlog drops. The earlier blocky/streaky picture was
+the input cap dropping whole I-frame bursts (7 % of frames); the cap is now
+500 frames (~190 kB), and a sent-vs-received frame compares byte-identical.
+
+Note: `pipe` transmits each frame **once** (no 2x repetition), so its capacity is
+~105 kB/s, roughly double what the 600 kbps stream needs — that headroom is what
+makes the picture clean.
 
 Latency budget: encoder ~50 ms (x264 veryfast, zerolatency) + TX backlog (up to
 1.8 s under bursts, normally a few frames) + RX window 150 ms + VLC cache
 1 s ≈ **1.3–3 s** end to end.
 
-![VLC playing the live pipeline](docs/vlc-qpsk-300k.png)
+![VLC playing the live pipeline](docs/vlc-qpsk-600k.png)
 
 (That screenshot is the QPSK/300 kbps path; `docs/vlc-live-pipeline.png` shows
 the earlier BPSK/100 kbps run.)
@@ -149,3 +160,4 @@ plus `--loop N` (0 = forever) in live mode.
 | `docs/vlc-sdr-playing.png` | VLC playing the store-and-forward stream |
 | `docs/vlc-live-pipeline.png` | VLC playing the realtime `cam` pipeline (BPSK/100k) |
 | `docs/vlc-qpsk-300k.png` | VLC playing the QPSK/300k pipeline |
+| `docs/vlc-qpsk-600k.png` | VLC playing 640x360 @ 600k, 99.8 % delivered |

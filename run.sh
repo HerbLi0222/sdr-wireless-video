@@ -47,7 +47,7 @@ if [ ! -f "$CLIP" ]; then
   else
     say "1. no VIDEO given — generating a synthetic 30 s source (lavfi testsrc2)"
     ffmpeg -y -hide_banner -loglevel error \
-      -f lavfi -i testsrc2=size=480x270:rate=20 \
+      -f lavfi -i testsrc2=size=640x360:rate=20 \
       -f lavfi -i sine=frequency=800:sample_rate=48000 \
       -t 30 -c:v libx264 -profile:v baseline -preset veryfast \
       -b:v 110k -maxrate 140k -bufsize 240k -g 40 -keyint_min 40 -sc_threshold 0 \
@@ -71,12 +71,12 @@ if [ "$MODE" = "cam" ]; then
   sleep 2
   say "3. live pipeline: synthetic camera -> x264 -> B210 -> UDP -> VLC"
   ffmpeg -hide_banner -loglevel error -re \
-    -f lavfi -i testsrc2=size=480x270:rate=20 \
+    -f lavfi -i testsrc2=size=640x360:rate=20 \
     -f lavfi -i sine=frequency=800:sample_rate=48000 \
     -t "${DURATION:-60}" \
     -c:v libx264 -profile:v baseline -preset veryfast -tune zerolatency \
-    -b:v 300k -maxrate 360k -bufsize 600k -g 10 -keyint_min 10 -sc_threshold 0 \
-    -c:a aac -b:a 32k -ac 2 -f mpegts - \
+    -b:v 600k -maxrate 700k -bufsize 1200k -g 20 -keyint_min 20 -sc_threshold 0 \
+    -c:a aac -b:a 48k -ac 2 -f mpegts - \
   | python3 sdr_link.py pipe --udp-port "$PORT" --duration "$(( ${DURATION:-60} + 15 ))" \
       --freq "$FREQ" --tx-gain "$TX_GAIN" --rx-gain "$RX_GAIN"
   exit 0
