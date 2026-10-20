@@ -8,7 +8,7 @@
 #
 # Env: FREQ=915e6 TX_GAIN=50 RX_GAIN=20 PORT=18096 LOOP=1 START=0 VIDEO=/path.mp4
 #   LOOP=0 -> keep streaming until Ctrl-C
-#   DURATION=60 -> seconds to run in cam mode
+#   DURATION=0  -> cam streams the whole input; >0 caps it
 #   cam: VIDEO streams that file at 1x; without VIDEO it uses testsrc2 (no camera needed)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -78,12 +78,17 @@ if [ "$MODE" = "cam" ]; then
     SRC=(-re -f lavfi -i "testsrc2=size=640x360:rate=20" -f lavfi -i "sine=frequency=800:sample_rate=48000")
     VF=()
   fi
-  ffmpeg -hide_banner -loglevel error "${SRC[@]}" \
-    -t "${DURATION:-60}" "${VF[@]}" \
+  TLIM=()
+  DUR_ARG=()
+  if [ "${DURATION:-0}" -gt 0 ] 2>/dev/null; then
+    TLIM=(-t "$DURATION")
+    DUR_ARG=(--duration "$(( DURATION + 15 ))")
+  fi
+  ffmpeg -hide_banner -loglevel error "${SRC[@]}" "${TLIM[@]}" "${VF[@]}" \
     -c:v libx264 -profile:v baseline -preset veryfast -tune zerolatency \
     -b:v 600k -maxrate 700k -bufsize 1200k -g 20 -keyint_min 20 -sc_threshold 0 \
     -c:a aac -b:a 48k -ac 2 -f mpegts - \
-  | python3 sdr_link.py pipe --udp-port "$PORT" --duration "$(( ${DURATION:-60} + 15 ))" \
+  | python3 sdr_link.py pipe --udp-port "$PORT" "${DUR_ARG[@]}" \
       --freq "$FREQ" --tx-gain "$TX_GAIN" --rx-gain "$RX_GAIN"
   exit 0
 fi

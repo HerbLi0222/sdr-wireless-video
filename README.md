@@ -46,9 +46,14 @@ uhd_find_devices          # must list a serial
 With your own source:
 
 ```bash
-VIDEO=~/Videos/clip.mp4 ./run.sh
-LOOP=0 ./run.sh           # keep streaming until Ctrl-C
+VIDEO=~/Videos/clip.mp4 ./run.sh          # 60 s by default
+DURATION=0 VIDEO=~/Videos/clip.mp4 ./run.sh   # stream the WHOLE file
+LOOP=0 ./run.sh                            # pre-encoded clip, forever
 ```
+
+`DURATION` is an optional cap: `0` removes `-t` and the whole input is streamed.
+Measured on the full 8:44 source (640x360 @ 550k): 12,128,256 B delivered over
+118.7 s at 102.2 kB/s, **99.96 %**, 0 drops — continuous, not a clip.
 
 The link sustains ≈**26 kB/s**, so the encoder targets ≈**24 kB/s** (110 kbps
 video + 24 kbps audio at 480×270/20 fps). Feed it anything that fits.
