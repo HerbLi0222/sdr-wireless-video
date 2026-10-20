@@ -75,8 +75,8 @@ if [ "$MODE" = "cam" ]; then
     -f lavfi -i sine=frequency=800:sample_rate=48000 \
     -t "${DURATION:-60}" \
     -c:v libx264 -profile:v baseline -preset veryfast -tune zerolatency \
-    -b:v 100k -maxrate 130k -bufsize 200k -g 20 -keyint_min 20 -sc_threshold 0 \
-    -c:a aac -b:a 20k -ac 2 -f mpegts - \
+    -b:v 300k -maxrate 360k -bufsize 600k -g 10 -keyint_min 10 -sc_threshold 0 \
+    -c:a aac -b:a 32k -ac 2 -f mpegts - \
   | python3 sdr_link.py pipe --udp-port "$PORT" --duration "$(( ${DURATION:-60} + 15 ))" \
       --freq "$FREQ" --tx-gain "$TX_GAIN" --rx-gain "$RX_GAIN"
   exit 0

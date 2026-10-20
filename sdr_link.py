@@ -15,6 +15,7 @@ whole TS packets and leaves the stream aligned.
 Rates: 3327 samples/frame = 3.327 ms -> 376 B / 3.327 ms ~= 113 kB/s ~= 0.9 Mbps.
 """
 import argparse
+import os
 import queue
 import sys
 import threading
@@ -32,7 +33,11 @@ PAYLOAD = 376            # 2 TS packets
 HDR = 4
 CRC = 4
 FRAME_BITS = (HDR + PAYLOAD + CRC) * 8
-FRAME_LEN = (PRE_LEN + FRAME_BITS) * SPB
+# QPSK doubles the payload rate at ~3 dB more SNR; SDR_MOD=bpsk falls back.
+MOD = os.environ.get("SDR_MOD", "qpsk").lower()
+BPS = 2 if MOD == "qpsk" else 1
+SYMBOLS = FRAME_BITS // BPS
+FRAME_LEN = (PRE_LEN + SYMBOLS) * SPB
 BYTES_PER_FRAME = PAYLOAD
 AIR_RATE = BYTES_PER_FRAME / (FRAME_LEN / FS)      # bytes/s
 
@@ -68,8 +73,14 @@ def frame_symbols(seq, payload):
     body = seq.to_bytes(HDR, "big") + scr(payload)
     raw = body + (zlib.crc32(body) & 0xFFFFFFFF).to_bytes(CRC, "big")
     bits = np.unpackbits(np.frombuffer(raw, np.uint8))
-    sym = (1.0 - 2.0 * bits).astype(np.float32)
-    return np.concatenate([PRE_UP, np.repeat(sym, SPB)])
+    if BPS == 1:
+        sig = np.repeat((1.0 - 2.0 * bits).astype(np.float32), SPB)
+    else:
+        b = bits.reshape(-1, 2)
+        i = (1.0 - 2.0 * b[:, 0]) / np.sqrt(2.0)
+        q = (1.0 - 2.0 * b[:, 1]) / np.sqrt(2.0)
+        sig = np.repeat((i + 1j * q).astype(np.complex64), SPB)
+    return np.concatenate([PRE_UP, sig])
 
 
 REPEAT = 2          # send every frame twice; the receiver keeps the first good copy
@@ -100,14 +111,23 @@ def demod_at(rx, pos):
     y = seg[PRE_UP_LEN:] * np.exp(-1j * phi)
     # integrate-and-dump over each symbol period: this is the matched filter
     sym = y.reshape(-1, SPB).mean(axis=1)
-    bits = (sym.real < 0).astype(np.uint8)
+    if BPS == 2:
+        bits = np.stack([sym.real < 0, sym.imag < 0], axis=1).astype(np.uint8).reshape(-1)
+    else:
+        bits = (sym.real < 0).astype(np.uint8)
     raw = np.packbits(bits).tobytes()
     body, crc = raw[:HDR + PAYLOAD], raw[HDR + PAYLOAD:]
     if (zlib.crc32(body) & 0xFFFFFFFF) != int.from_bytes(crc, "big"):
         return None
-    amp = float(np.mean(np.abs(sym.real)))
-    noise = float(np.mean(np.abs(sym.imag)))
-    snr = 20 * np.log10(amp / noise) if noise > 0 else 99.0
+    if BPS == 2:
+        dec = (np.sign(sym.real) + 1j * np.sign(sym.imag)) / np.sqrt(2.0)
+        scale = float(np.mean(np.abs(sym)))
+        evm = float(np.sqrt(np.mean(np.abs(sym - scale * dec) ** 2)) / (scale + 1e-12))
+        amp, snr = scale, (20 * np.log10(1.0 / evm) if evm > 0 else 99.0)
+    else:
+        amp = float(np.mean(np.abs(sym.real)))
+        noise = float(np.mean(np.abs(sym.imag)))
+        snr = 20 * np.log10(amp / noise) if noise > 0 else 99.0
     return {"seq": int.from_bytes(body[:HDR], "big"),
             "payload": scr(body[HDR:]), "amp": amp, "snr": snr}
 
@@ -373,6 +393,26 @@ def run_selftest(a):
 
 
 
+
+def emit_in_order(got, nxt, send, gap=8, force=False):
+    """Send payloads in sequence order. One lost frame would block the stream
+    forever, so allow a small reorder window and skip larger gaps (or any gap
+    after a stall)."""
+    if got and min(got) < nxt:
+        for k in [k for k in got if k < nxt]:
+            del got[k]
+    sent = 0
+    while nxt in got:
+        send(got.pop(nxt)[0])
+        sent += PAYLOAD
+        nxt += 1
+    if got:
+        m = min(got)
+        if m - nxt > gap or force:
+            nxt = m
+    return nxt, sent
+
+
 def run_live(a):
     """Continuous mode: stream a TS file over the air, forward decoded bytes to
     a UDP sink as they arrive (VLC plays udp://@host:port)."""
@@ -414,6 +454,8 @@ def run_live(a):
     carry = np.zeros(0, np.complex64)
     got = {}
     nxt = 0
+    started = False
+    last_emit = time.time()
     written = 0
     t0 = time.time()
     got_total = 0
@@ -428,11 +470,14 @@ def run_live(a):
         window = np.concatenate([carry, buf[:c]])
         frames, _, _ = demod_stream(window)
         got.update({k: v for k, v in frames.items() if k not in got})
-        # emit in order
-        while nxt in got:
-            sock.sendto(got.pop(nxt)[0], dest)
-            written += PAYLOAD
-            nxt += 1
+        if not started and got:
+            nxt = min(got)
+            started = True
+        nxt, sent = emit_in_order(got, nxt, lambda b: sock.sendto(b, dest),
+                                  force=(time.time() - last_emit) > 0.4)
+        if sent:
+            last_emit = time.time()
+        written += sent
         carry = window[-overlap:]
     # drain
     t.join(timeout=5)
@@ -443,7 +488,7 @@ def run_live(a):
 
 
 
-def demod_window(rx, thresh=10.0, topk=30, sep=250):
+def demod_window(rx, thresh=10.0, topk=80, sep=200):
     """Cheap streaming demodulation: one correlation pass, then try the strongest
     few candidates (NMS). Far cheaper than demod_stream's exhaustive resync."""
     mag = corr_mag(rx, PRE_UP.astype(np.complex64))
@@ -549,6 +594,8 @@ def run_pipe(a):
     carry = np.zeros(0, np.complex64)
     got = {}
     nxt = 0
+    started = False
+    last_emit = time.time()
     t0 = time.time()
     deadline = t0 + a.duration if a.duration else None
     while True:
@@ -563,10 +610,14 @@ def run_pipe(a):
             continue
         window = np.concatenate([carry, cbuf[:c]])
         got.update({k: v for k, v in demod_window(window).items() if k not in got})
-        while nxt in got:
-            sock.sendto(got.pop(nxt)[0], dest)
-            stats["out"] += PAYLOAD
-            nxt += 1
+        if not started and got:
+            nxt = min(got)
+            started = True
+        nxt, sent = emit_in_order(got, nxt, lambda b: sock.sendto(b, dest),
+                                  force=(time.time() - last_emit) > 0.4)
+        if sent:
+            last_emit = time.time()
+        stats["out"] += sent
         carry = window[-overlap:]
         if not th_t.is_alive() and eof.is_set():
             # drain the tail once the transmitter has stopped

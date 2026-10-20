@@ -71,29 +71,33 @@ frames them as they arrive and transmits immediately; the receiver demodulates i
 live: in 927592 B, out 912928 B, frames 2434, dropped 33, 38.3 s -> 23.8 kB/s
 ```
 
-98.4 % of the encoded stream made it through; the 33 dropped frames were
-I-frame bursts overflowing the 45 kB (≈1.8 s) backlog cap.
+QPSK run at 300 kbps + 32 kbps: 1,990,168 of 2,036,416 B (97.7 %) delivered at
+**52.0 kB/s**; the short GOP (10 frames) means a lost frame heals within 0.5 s.
 
 Latency budget: encoder ~50 ms (x264 veryfast, zerolatency) + TX backlog (up to
 1.8 s under bursts, normally a few frames) + RX window 150 ms + VLC cache
 1 s ≈ **1.3–3 s** end to end.
 
-![VLC playing the live pipeline](docs/vlc-live-pipeline.png)
+![VLC playing the live pipeline](docs/vlc-qpsk-300k.png)
+
+(That screenshot is the QPSK/300 kbps path; `docs/vlc-live-pipeline.png` shows
+the earlier BPSK/100 kbps run.)
 
 ## Parameters
 
 | item | value |
 |---|---|
 | sample rate | 1 MSps |
-| modulation | BPSK, 2 samples/symbol (500 ksym/s) |
-| preamble | 255-bit m-sequence, rectangular pulse |
+| modulation | **QPSK**, 2 samples/symbol (500 ksym/s) — `SDR_MOD=bpsk` falls back |
+| preamble | 255-bit m-sequence, rectangular pulse (BPSK, 510 samples) |
 | frame | preamble + seq(4 B) + payload(376 B = 2 TS packets) + CRC32 |
-| frame length | 6654 samples ≈ 6.65 ms |
-| raw rate | 0.5 Mbps |
+| frame length | 3582 samples ≈ 3.58 ms (QPSK) / 6654 ≈ 6.65 ms (BPSK) |
+| raw rate | 1 Mbps (QPSK) / 0.5 Mbps (BPSK) |
 | repetition | every frame sent twice |
-| **payload throughput** | **≈ 26 kB/s (~210 kbps)** |
+| **payload throughput** | **≈ 52 kB/s (~420 kbps)** QPSK, ≈26 kB/s BPSK |
 | measured SNR | ~22 dB |
-| frame success | 2642/2642 (full clip), 1904/1904 (30 s live clip) |
+| frame success | QPSK file transfer 1950/1950, byte-exact |
+| realtime cam | 97.7 % delivered, 52.0 kB/s over 38 s |
 
 CLI: `--freq 915e6 --tx-ch 1 --rx-ch 1 --rx-ant RX2 --tx-gain 50 --rx-gain 20`,
 plus `--loop N` (0 = forever) in live mode.
@@ -143,4 +147,5 @@ plus `--loop N` (0 = forever) in live mode.
 | `run.sh` | one-command demo (check → encode → stream → VLC) |
 | `setup.sh` | host setup: UHD, udev rules, FPGA images |
 | `docs/vlc-sdr-playing.png` | VLC playing the store-and-forward stream |
-| `docs/vlc-live-pipeline.png` | VLC playing the realtime `cam` pipeline |
+| `docs/vlc-live-pipeline.png` | VLC playing the realtime `cam` pipeline (BPSK/100k) |
+| `docs/vlc-qpsk-300k.png` | VLC playing the QPSK/300k pipeline |
