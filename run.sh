@@ -69,11 +69,17 @@ if [ "$MODE" = "cam" ]; then
   vlc --no-video-title-show --network-caching=1000 "udp://@127.0.0.1:$PORT" >/tmp/vlc-sdr.log 2>&1 &
   VLC_PID=$!
   sleep 2
-  say "3. live pipeline: synthetic camera -> x264 -> B210 -> UDP -> VLC"
-  ffmpeg -hide_banner -loglevel error -re \
-    -f lavfi -i testsrc2=size=640x360:rate=20 \
-    -f lavfi -i sine=frequency=800:sample_rate=48000 \
-    -t "${DURATION:-60}" \
+  if [ -n "$VIDEO" ] && [ -f "$VIDEO" ]; then
+    say "3. live pipeline: $VIDEO (played at 1x) -> x264 -> B210 -> UDP -> VLC"
+    SRC=(-re -ss "$START" -i "$VIDEO")
+    VF=(-vf "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2")
+  else
+    say "3. live pipeline: synthetic camera (testsrc2) -> x264 -> B210 -> UDP -> VLC"
+    SRC=(-re -f lavfi -i "testsrc2=size=640x360:rate=20" -f lavfi -i "sine=frequency=800:sample_rate=48000")
+    VF=()
+  fi
+  ffmpeg -hide_banner -loglevel error "${SRC[@]}" \
+    -t "${DURATION:-60}" "${VF[@]}" \
     -c:v libx264 -profile:v baseline -preset veryfast -tune zerolatency \
     -b:v 600k -maxrate 700k -bufsize 1200k -g 20 -keyint_min 20 -sc_threshold 0 \
     -c:a aac -b:a 48k -ac 2 -f mpegts - \

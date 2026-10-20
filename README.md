@@ -53,6 +53,26 @@ LOOP=0 ./run.sh           # keep streaming until Ctrl-C
 The link sustains ≈**26 kB/s**, so the encoder targets ≈**24 kB/s** (110 kbps
 video + 24 kbps audio at 480×270/20 fps). Feed it anything that fits.
 
+## Where the video comes from
+
+| mode | source |
+|---|---|
+| `cam` (no `VIDEO`) | synthetic `testsrc2` colour bars — no camera is attached here |
+| `cam` with `VIDEO=…` | that file, played at 1x and encoded live |
+| `live` / `file` | a pre-encoded `.ts` clip (store-and-forward) |
+
+Keep the source light: streaming the 1080p original through `cam` starves the
+Python link (ffmpeg decode+scale competes for CPU) and only ~29 % of frames get
+through. A 640x360 source streams cleanly:
+
+```
+live: in 3523496 B, out 3511088 B, frames 9371, dropped 0, 33.8 s -> 103.9 kB/s
+```
+
+99.65 % delivered at the link's ceiling, picture sharp.
+
+![VLC playing the real video](docs/vlc-live-video.png)
+
 ## Realtime pipeline (`cam`)
 
 ```
@@ -161,3 +181,4 @@ plus `--loop N` (0 = forever) in live mode.
 | `docs/vlc-live-pipeline.png` | VLC playing the realtime `cam` pipeline (BPSK/100k) |
 | `docs/vlc-qpsk-300k.png` | VLC playing the QPSK/300k pipeline |
 | `docs/vlc-qpsk-600k.png` | VLC playing 640x360 @ 600k, 99.8 % delivered |
+| `docs/vlc-live-video.png` | real video file streamed live, 99.65 % delivered |
