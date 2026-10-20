@@ -1,0 +1,11 @@
+# generated media and artifacts
+*.ts
+*.mp4
+*.webm
+*.mkv
+*.m4s
+*.bin
+rx_check.ts
+clip.ts
+__pycache__/
+*.pyc
