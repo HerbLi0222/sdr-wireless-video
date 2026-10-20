@@ -37,7 +37,8 @@ uhd_find_devices          # must list a serial
 ## Quick start
 
 ```bash
-./run.sh                  # synthetic or VIDEO source -> over the air -> VLC
+./run.sh cam              # REALTIME: camera -> encode -> air -> VLC (no pre-clip)
+./run.sh                  # store-and-forward: encode a file, then stream it
 ./run.sh file             # transmit and verify the payload byte-exactly
 ./run.sh selftest         # modem only, no radio
 ```
@@ -51,6 +52,33 @@ LOOP=0 ./run.sh           # keep streaming until Ctrl-C
 
 The link sustains ≈**26 kB/s**, so the encoder targets ≈**24 kB/s** (110 kbps
 video + 24 kbps audio at 480×270/20 fps). Feed it anything that fits.
+
+## Realtime pipeline (`cam`)
+
+```
+lavfi/fake camera ──► x264+aac ──► MPEG-TS ──► 376 B framing ──► BPSK ──► TX
+   (1x realtime)        (1x)          (pipe)        (on the fly)              │
+                                                                        air
+                                                                             │
+             VLC ◄── UDP ◄── ordered payloads ◄── demod ◄── 0.15 s windows ◄── RX
+```
+
+Nothing is pre-built: ffmpeg encodes at 1×, the link reads TS bytes off the pipe,
+frames them as they arrive and transmits immediately; the receiver demodulates in
+150 ms windows and forwards payloads in sequence order. Measured over 38 s:
+
+```
+live: in 927592 B, out 912928 B, frames 2434, dropped 33, 38.3 s -> 23.8 kB/s
+```
+
+98.4 % of the encoded stream made it through; the 33 dropped frames were
+I-frame bursts overflowing the 45 kB (≈1.8 s) backlog cap.
+
+Latency budget: encoder ~50 ms (x264 veryfast, zerolatency) + TX backlog (up to
+1.8 s under bursts, normally a few frames) + RX window 150 ms + VLC cache
+1 s ≈ **1.3–3 s** end to end.
+
+![VLC playing the live pipeline](docs/vlc-live-pipeline.png)
 
 ## Parameters
 
@@ -98,10 +126,11 @@ plus `--loop N` (0 = forever) in live mode.
 
 - **One-way**: no feedback, no retransmission, no rate adaptation.
 - ~210 kbps payload — enough for 480×270/20 fps; 720p would need QPSK/QAM.
-- **This is a transport demo, not a camera pipeline.** The source is a
-  pre-encoded file, so the receiver may run ahead of playback. A real camera
-  feed must be encoded at exactly 1× and needs a bounded buffer plus a drop
-  policy; the RF layer itself would be unchanged.
+- `cam` is a true 1× pipeline; `live` is store-and-forward (pre-encoded file,
+  receiver may run ahead). Use `cam` to emulate a camera; swap the lavfi inputs
+  for `-f v4l2 -i /dev/video0` when a camera is attached.
+- The backlog cap drops whole frames when the encoder bursts (I-frames); that is
+  the trade-off for bounded latency.
 - Single radio on both ends means carrier/sample offsets are zero by
   construction; two separate USRPs would need CFO estimation and timing
   recovery.
@@ -113,4 +142,5 @@ plus `--loop N` (0 = forever) in live mode.
 | `sdr_link.py` | modem + `selftest` / `file` / `live` modes |
 | `run.sh` | one-command demo (check → encode → stream → VLC) |
 | `setup.sh` | host setup: UHD, udev rules, FPGA images |
-| `docs/vlc-sdr-playing.png` | VLC playing the received stream |
+| `docs/vlc-sdr-playing.png` | VLC playing the store-and-forward stream |
+| `docs/vlc-live-pipeline.png` | VLC playing the realtime `cam` pipeline |

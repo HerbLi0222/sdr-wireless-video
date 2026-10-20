@@ -3,10 +3,12 @@
 #
 #   ./run.sh              # live: encode -> transmit over the air -> VLC plays
 #   ./run.sh file         # store-and-forward + byte-exact integrity check
+#   ./run.sh cam          # realtime pipeline: camera->encode->air->VLC
 #   ./run.sh selftest     # modem only, no radio
 #
 # Env: FREQ=915e6 TX_GAIN=50 RX_GAIN=20 PORT=18096 LOOP=1 START=0 VIDEO=/path.mp4
 #   LOOP=0 -> keep streaming until Ctrl-C
+#   DURATION=60 -> seconds to run in cam mode
 #   VIDEO unset -> a synthetic 30 s source is generated (no camera needed)
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -59,6 +61,24 @@ if [ "$MODE" = "file" ]; then
     --freq "$FREQ" --tx-gain "$TX_GAIN" --rx-gain "$RX_GAIN"
   say "3. integrity check"
   cmp -n "$(stat -c%s "$CLIP")" "$CLIP" rx_check.ts && echo "BYTE-EXACT over the air"
+  exit 0
+fi
+
+if [ "$MODE" = "cam" ]; then
+  say "2. starting VLC on udp://@127.0.0.1:$PORT"
+  vlc --no-video-title-show --network-caching=1000 "udp://@127.0.0.1:$PORT" >/tmp/vlc-sdr.log 2>&1 &
+  VLC_PID=$!
+  sleep 2
+  say "3. live pipeline: synthetic camera -> x264 -> B210 -> UDP -> VLC"
+  ffmpeg -hide_banner -loglevel error -re \
+    -f lavfi -i testsrc2=size=480x270:rate=20 \
+    -f lavfi -i sine=frequency=800:sample_rate=48000 \
+    -t "${DURATION:-60}" \
+    -c:v libx264 -profile:v baseline -preset veryfast -tune zerolatency \
+    -b:v 100k -maxrate 130k -bufsize 200k -g 20 -keyint_min 20 -sc_threshold 0 \
+    -c:a aac -b:a 20k -ac 2 -f mpegts - \
+  | python3 sdr_link.py pipe --udp-port "$PORT" --duration "$(( ${DURATION:-60} + 15 ))" \
+      --freq "$FREQ" --tx-gain "$TX_GAIN" --rx-gain "$RX_GAIN"
   exit 0
 fi
 

@@ -408,8 +408,8 @@ def run_live(a):
     t = threading.Thread(target=tx_loop, daemon=True)
     t.start()
 
-    chunk = int(0.25 * FS)
-    overlap = int(0.08 * FS)
+    chunk = int(0.15 * FS)
+    overlap = int(0.05 * FS)
     buf = np.zeros(chunk, np.complex64)
     carry = np.zeros(0, np.complex64)
     got = {}
@@ -441,9 +441,148 @@ def run_live(a):
     return 0
 
 
+
+
+def demod_window(rx, thresh=10.0, topk=30, sep=250):
+    """Cheap streaming demodulation: one correlation pass, then try the strongest
+    few candidates (NMS). Far cheaper than demod_stream's exhaustive resync."""
+    mag = corr_mag(rx, PRE_UP.astype(np.complex64))
+    out = {}
+    tried = []
+    for i in np.argsort(mag)[::-1]:
+        if len(tried) >= topk:
+            break
+        i = int(i)
+        if any(abs(i - j) < sep for j in tried):
+            continue
+        tried.append(i)
+        p = refine(rx, i, span=8)
+        r = demod_at(rx, p)
+        if r is not None:
+            out[r["seq"]] = (r["payload"], r["snr"], r["amp"])
+    return out
+
+def run_pipe(a):
+    """True live pipeline: read MPEG-TS from stdin as it is produced, frame it,
+    transmit immediately, and forward decoded bytes to a UDP sink.
+
+    Unlike `live`, nothing is pre-built: the encoder runs at 1x, bytes arrive
+    continuously, and the link consumes them at the same rate it sends them.
+    """
+    import socket
+    link = Link(a)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dest = (a.udp_host, a.udp_port)
+    print(f"live pipeline: stdin -> B210 ch{a.tx_ch}/ch{a.rx_ch} @ {a.freq/1e6:.3f} MHz "
+          f"-> udp://{a.udp_host}:{a.udp_port}", flush=True)
+
+    buf = bytearray()
+    lock = threading.Lock()
+    eof = threading.Event()
+    stats = {"in": 0, "out": 0, "sent": 0, "dropped": 0}
+    max_backlog = 120 * PAYLOAD         # ~45 kB ~ 1.8 s of stream; drop oldest beyond
+
+    def reader():
+        while True:
+            chunk = sys.stdin.buffer.read(4096)
+            if not chunk:
+                eof.set()
+                return
+            with lock:
+                buf.extend(chunk)
+                stats["in"] += len(chunk)
+                while len(buf) > max_backlog:      # encoder outrunning the link
+                    del buf[:PAYLOAD]
+                    stats["dropped"] += 1
+
+    def tx():
+        seq = 0
+        first = True
+        pending = np.zeros(0, np.complex64)
+        while True:
+            data = None
+            with lock:
+                if len(buf) >= PAYLOAD:
+                    data = bytes(buf[:PAYLOAD])
+                    del buf[:PAYLOAD]
+            if data is not None:
+                pending = np.concatenate(
+                    [pending, (frame_symbols(seq, data) * a.tx_amp).astype(np.complex64)])
+                seq += 1
+            if pending.size == 0:
+                if eof.is_set():
+                    break
+                # keep the TX stream fed with silence instead of underflowing;
+                # the receiver simply sees a gap between frames
+                pending = np.zeros(2040, np.complex64)
+            n = int(min(2040, pending.size))
+            md = uhd.types.TXMetadata()
+            md.start_of_burst = first
+            md.end_of_burst = False
+            sent = link.tst.send(pending[:n], md, 1.0)
+            if sent <= 0:
+                break
+            pending = pending[sent:]
+            first = False
+            stats["sent"] = seq
+        # final chunk with end-of-burst
+        if not first:
+            md = uhd.types.TXMetadata()
+            md.start_of_burst = False
+            md.end_of_burst = True
+            link.tst.send(np.zeros(2040, np.complex64), md, 1.0)
+        stats["done"] = True
+
+    th_r = threading.Thread(target=reader, daemon=True)
+    th_t = threading.Thread(target=tx, daemon=True)
+    th_r.start()
+    th_t.start()
+
+    cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
+    cmd.stream_now = True
+    link.rst.issue_stream_cmd(cmd)
+
+    chunk = int(0.15 * FS)
+    overlap = int(0.05 * FS)
+    cbuf = np.zeros(chunk, np.complex64)
+    md = uhd.types.RXMetadata()
+    carry = np.zeros(0, np.complex64)
+    got = {}
+    nxt = 0
+    t0 = time.time()
+    deadline = t0 + a.duration if a.duration else None
+    while True:
+        if not th_t.is_alive() and not got:
+            break                       # tx finished and nothing buffered
+        if deadline and time.time() > deadline:
+            break
+        c = link.rst.recv(cbuf, md, 0.5)
+        if c <= 0:
+            if not th_t.is_alive():
+                break
+            continue
+        window = np.concatenate([carry, cbuf[:c]])
+        got.update({k: v for k, v in demod_window(window).items() if k not in got})
+        while nxt in got:
+            sock.sendto(got.pop(nxt)[0], dest)
+            stats["out"] += PAYLOAD
+            nxt += 1
+        carry = window[-overlap:]
+        if not th_t.is_alive() and eof.is_set():
+            # drain the tail once the transmitter has stopped
+            time.sleep(0.3)
+            break
+    link.rst.issue_stream_cmd(uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont))
+    th_t.join(timeout=2)
+    dur = time.time() - t0
+    print(f"live: in {stats['in']} B, out {stats['out']} B, frames {stats['sent']}, "
+          f"dropped {stats['dropped']}, {dur:.1f} s -> {stats['out']/max(dur,1e-9)/1e3:.1f} kB/s")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["file", "selftest", "live"])
+    ap.add_argument("mode", choices=["file", "selftest", "live", "pipe"])
     ap.add_argument("--input")
     ap.add_argument("--output")
     ap.add_argument("--freq", type=float, default=915e6)
@@ -456,6 +595,7 @@ def main():
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--udp-host", default="127.0.0.1")
     ap.add_argument("--udp-port", type=int, default=18096)
+    ap.add_argument("--duration", type=float, default=0.0, help="stop after N seconds (0=until stdin EOF)")
     ap.add_argument("--loop", type=int, default=1,
                     help="re-send the file N times, 0 = forever (seq continues)")
     a = ap.parse_args()
@@ -463,6 +603,8 @@ def main():
         return run_selftest(a)
     if a.mode == "live":
         return run_live(a)
+    if a.mode == "pipe":
+        return run_pipe(a)
     return run_file(a)
 
 
