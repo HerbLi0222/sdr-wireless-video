@@ -59,6 +59,20 @@ assert PRE.size == PRE_LEN
 PRE_UP = np.repeat(PRE, SPB).astype(np.float32)     # rectangular pulse, SPB samples/sym
 PRE_UP_LEN = PRE_UP.size
 
+# CFO helpers. The preamble is split on a symbol boundary; the phase advance
+# between the two half-correlations is the carrier offset. This matters when
+# TX and RX are separate radios (independent LOs); on one B210 it stays ~0.
+_HALF = (PRE_UP_LEN // (2 * SPB)) * SPB
+_CENTER = PRE_UP_LEN / 2.0
+_PAY_IDX = np.arange(FRAME_LEN - PRE_UP_LEN, dtype=np.float32)
+# Startup calibration: N back-to-back preambles give a ~N x longer phase
+# baseline than one frame, so the two-radio CFO is measured once up front.
+CAL_PRE = 32
+# Smoothed CFO from frames that had a long baseline; used when a frame's
+# neighbour preamble is missing (e.g. silence between frames in `pipe`).
+_CFO_HINT = 0.0
+_CFO_HAVE = False
+
 
 # ---------------------------------------------------------------- modulator
 _rng = np.random.default_rng(0x5EED)
@@ -101,35 +115,79 @@ def build_frames(data, seq0=0):
 # -------------------------------------------------------------- demodulator
 def demod_at(rx, pos):
     """Try to decode one frame starting at sample pos. Returns dict or None."""
+    global _CFO_HINT, _CFO_HAVE
     if pos < 0 or pos + FRAME_LEN > rx.size:
         return None
     seg = rx[pos:pos + FRAME_LEN]
-    c = float(np.dot(seg[:PRE_UP_LEN].real, PRE_UP)) + 1j * float(np.dot(seg[:PRE_UP_LEN].imag, PRE_UP))
+    pre = seg[:PRE_UP_LEN]
+    c1 = np.dot(pre[:_HALF], PRE_UP[:_HALF])
+    c2 = np.dot(pre[_HALF:], PRE_UP[_HALF:])
+    c = c1 + c2
     if abs(c) < 1e-9:
         return None
-    phi = np.angle(c)
-    y = seg[PRE_UP_LEN:] * np.exp(-1j * phi)
-    # integrate-and-dump over each symbol period: this is the matched filter
-    sym = y.reshape(-1, SPB).mean(axis=1)
-    if BPS == 2:
-        bits = np.stack([sym.real < 0, sym.imag < 0], axis=1).astype(np.uint8).reshape(-1)
+    phi = np.angle(c)                       # phase at the preamble centre
+    # phase advance between the two half-correlations -> coarse carrier offset
+    dphi = np.angle(c2 * np.conj(c1))
+    f_coarse = dphi * FS / (2.0 * np.pi * _CENTER)
+    # Refine on a 14x longer baseline: the next frame's preamble is one frame
+    # away. Its phase is only known modulo 1/FRAME_LEN, so unwrap with the
+    # coarse estimate. This matters on a real two-radio link, where the short
+    # baseline is too noisy (~30 Hz at 14 dB) to keep QPSK phase over 3 ms.
+    base, long_ok = f_coarse, False
+    if pos + FRAME_LEN + PRE_UP_LEN <= rx.size:
+        nxt = rx[pos + FRAME_LEN:pos + FRAME_LEN + PRE_UP_LEN]
+        cn = (np.dot(nxt[:_HALF], PRE_UP[:_HALF]) +
+              np.dot(nxt[_HALF:], PRE_UP[_HALF:]))
+        if abs(cn) > 0.5 * abs(c):
+            f_long = np.angle(cn * np.conj(c)) * FS / (2.0 * np.pi * FRAME_LEN)
+            k = np.round((f_coarse - f_long) * FRAME_LEN / FS)
+            base, long_ok = f_long + k * FS / FRAME_LEN, True
+    if not long_ok and _CFO_HAVE:
+        base = _CFO_HINT
+    # Search only when needed: a frame with a long baseline costs one attempt;
+    # with a hint, allow a small drift search; with neither, search the coarse
+    # estimate widely until one frame decodes.
+    if long_ok:
+        offsets = (0.0,)
+    elif _CFO_HAVE:
+        offsets = (0, -20, 20, -40, 40, -60, 60, -80, 80,
+                   -100, 100, -120, 120, -140, 140)
     else:
-        bits = (sym.real < 0).astype(np.uint8)
-    raw = np.packbits(bits).tobytes()
-    body, crc = raw[:HDR + PAYLOAD], raw[HDR + PAYLOAD:]
-    if (zlib.crc32(body) & 0xFFFFFFFF) != int.from_bytes(crc, "big"):
-        return None
-    if BPS == 2:
-        dec = (np.sign(sym.real) + 1j * np.sign(sym.imag)) / np.sqrt(2.0)
-        scale = float(np.mean(np.abs(sym)))
-        evm = float(np.sqrt(np.mean(np.abs(sym - scale * dec) ** 2)) / (scale + 1e-12))
-        amp, snr = scale, (20 * np.log10(1.0 / evm) if evm > 0 else 99.0)
-    else:
-        amp = float(np.mean(np.abs(sym.real)))
-        noise = float(np.mean(np.abs(sym.imag)))
-        snr = 20 * np.log10(amp / noise) if noise > 0 else 99.0
-    return {"seq": int.from_bytes(body[:HDR], "big"),
-            "payload": scr(body[HDR:]), "amp": amp, "snr": snr}
+        offsets = (0, -20, 20, -40, 40, -60, 60, -80, 80, -100, 100)
+    for off in offsets:
+        f_cfo = base + off
+        # derotate for the centre phase and the linear CFO ramp
+        y = seg[PRE_UP_LEN:] * np.exp(
+            -1j * (phi + 2.0 * np.pi * f_cfo * (_CENTER + _PAY_IDX) / FS))
+        # integrate-and-dump over each symbol period: this is the matched filter
+        sym = y.reshape(-1, SPB).mean(axis=1)
+        if BPS == 2:
+            bits = np.stack([sym.real < 0, sym.imag < 0], axis=1).astype(np.uint8).reshape(-1)
+        else:
+            bits = (sym.real < 0).astype(np.uint8)
+        raw = np.packbits(bits).tobytes()
+        body, crc = raw[:HDR + PAYLOAD], raw[HDR + PAYLOAD:]
+        if (zlib.crc32(body) & 0xFFFFFFFF) != int.from_bytes(crc, "big"):
+            continue
+        if BPS == 2:
+            dec = (np.sign(sym.real) + 1j * np.sign(sym.imag)) / np.sqrt(2.0)
+            scale = float(np.mean(np.abs(sym)))
+            evm = float(np.sqrt(np.mean(np.abs(sym - scale * dec) ** 2)) / (scale + 1e-12))
+            amp, snr = scale, (20 * np.log10(1.0 / evm) if evm > 0 else 99.0)
+        else:
+            amp = float(np.mean(np.abs(sym.real)))
+            noise = float(np.mean(np.abs(sym.imag)))
+            snr = 20 * np.log10(amp / noise) if noise > 0 else 99.0
+        _CFO_HINT = f_cfo if not _CFO_HAVE else 0.8 * _CFO_HINT + 0.2 * f_cfo
+        _CFO_HAVE = True
+        return {"seq": int.from_bytes(body[:HDR], "big"),
+                "payload": scr(body[HDR:]), "amp": amp, "snr": snr, "cfo": f_cfo}
+    return None
+
+
+def _entry(r):
+    """Tuple stored by the demodulators (payload, SNR, amplitude, CFO)."""
+    return (r["payload"], r["snr"], r["amp"], r["cfo"])
 
 
 def corr_mag(seg, pre_c):
@@ -170,14 +228,19 @@ def candidates(rx, topk=400, sep=800):
 
 
 def _resync(rx, pos, window=3 * FRAME_LEN, tries=40, sep=300):
-    """Find a decodable frame near pos. Candidates are non-maximum suppressed:
-    without that, the top hits are all the same peak's neighbours."""
+    """Find a decodable frame near pos, earliest first.
+
+    Candidates are non-maximum suppressed. Trying them earliest-first (rather
+    than strongest-first) keeps the chain anchored near the start of the
+    capture, so a later dropout cannot strand everything before it.
+    """
     end = min(pos + window, rx.size)
     if end - pos < FRAME_LEN:
         return None
     mag = corr_mag(rx[pos:end], PRE_UP.astype(np.complex64))
+    thresh = 0.3 * float(mag.max()) if mag.size else 0.0
     tried = []
-    for i in np.argsort(mag)[::-1]:
+    for i in np.nonzero(mag >= thresh)[0]:
         if len(tried) >= tries:
             break
         i = int(i)
@@ -191,6 +254,56 @@ def _resync(rx, pos, window=3 * FRAME_LEN, tries=40, sep=300):
     return None
 
 
+def cal_symbols(amp=1.0):
+    """The startup calibration burst: CAL_PRE consecutive preambles."""
+    return (np.tile(PRE_UP, CAL_PRE) * amp).astype(np.complex64)
+
+
+def calibrate(rx):
+    """Measure the CFO from the preamble-train burst at the start of a capture.
+
+    Sets the demodulator's CFO hint and returns the sample just past the
+    burst (0 if no train was found, in which case the per-frame estimator
+    takes over). One frame's two preamble halves are only a 255 us baseline
+    (~30 Hz error at 14 dB, too noisy for QPSK over 3 ms); the train gives
+    CAL_PRE times that, so the residual is a few Hz.
+    """
+    global _CFO_HINT, _CFO_HAVE
+    n = min(rx.size, int(0.5 * FS))
+    if n < PRE_UP_LEN * 8:
+        return 0
+    seg = rx[:n]
+    mag = corr_mag(seg, PRE_UP.astype(np.complex64))
+    thresh = 0.5 * float(mag.max())
+    cand = np.nonzero(mag >= thresh)[0]
+    if cand.size == 0:
+        return 0
+    for p0 in cand[:6]:
+        p0 = refine(seg, int(p0), span=4)
+        ph, mg = [], []
+        p = p0
+        for _ in range(CAL_PRE):
+            if p + PRE_UP_LEN > seg.size:
+                break
+            c = np.dot(seg[p:p + PRE_UP_LEN], PRE_UP)
+            ph.append(np.angle(c)); mg.append(abs(c))
+            p += PRE_UP_LEN
+        # A data frame one frame later is not a train; require most peaks to
+        # be present and comparable in strength.
+        if len(ph) < 8 or min(mg) < 0.3 * mg[0]:
+            continue
+        ph = np.unwrap(np.array(ph))
+        slope = np.polyfit(np.arange(len(ph)), ph, 1)[0]
+        f = slope * FS / (2.0 * np.pi * PRE_UP_LEN)
+        if abs(f) > FS / (2.0 * PRE_UP_LEN):          # outside unambiguous range
+            continue
+        _CFO_HINT = float(f)
+        _CFO_HAVE = True
+        print(f"cfo calibration: {f:+.1f} Hz ({len(ph)} preambles)", flush=True)
+        return p0 + len(ph) * PRE_UP_LEN
+    return 0
+
+
 def demod_stream(rx, log=print):
     """Chain frames with local refinement; resync if the chain breaks."""
     got = {}
@@ -198,7 +311,7 @@ def demod_stream(rx, log=print):
     if res is None:
         return got, 1, 0
     p, r = res
-    got[r["seq"]] = (r["payload"], r["snr"], r["amp"])
+    got[r["seq"]] = _entry(r)
     # walk backwards first: _resync may have landed on a later frame
     b = p - FRAME_LEN
     while b > 0:
@@ -206,7 +319,7 @@ def demod_stream(rx, log=print):
         rb = demod_at(rx, b)
         if rb is None:
             break
-        got[rb["seq"]] = (rb["payload"], rb["snr"], rb["amp"])
+        got[rb["seq"]] = _entry(rb)
         b -= FRAME_LEN
     q = p + FRAME_LEN
     gaps = 0
@@ -214,11 +327,11 @@ def demod_stream(rx, log=print):
         q = refine(rx, q, span=12)
         r = demod_at(rx, q)
         if r is not None:
-            got[r["seq"]] = (r["payload"], r["snr"], r["amp"])
+            got[r["seq"]] = _entry(r)
             q += FRAME_LEN
             gaps = 0
             continue
-        found = _resync(rx, q, window=4 * FRAME_LEN, tries=60)
+        found = _resync(rx, q, window=16 * FRAME_LEN, tries=160)
         if found is None:
             gaps += 1
             q += FRAME_LEN
@@ -226,7 +339,7 @@ def demod_stream(rx, log=print):
                 break
             continue
         p, r = found
-        got[r["seq"]] = (r["payload"], r["snr"], r["amp"])
+        got[r["seq"]] = _entry(r)
         q = p + FRAME_LEN
         gaps = 0
     return got, 0, 0
@@ -236,31 +349,43 @@ def demod_stream(rx, log=print):
 class Link:
     def __init__(self, a):
         self.a = a
-        self.u = uhd.usrp.MultiUSRP("type=b200")
-        self.u.set_tx_rate(FS)
-        self.u.set_rx_rate(FS)
-        self.u.set_tx_freq(uhd.types.TuneRequest(a.freq), a.tx_ch)
-        self.u.set_rx_freq(uhd.types.TuneRequest(a.freq), a.rx_ch)
-        self.u.set_tx_gain(a.tx_gain, a.tx_ch)
-        self.u.set_rx_gain(a.rx_gain, a.rx_ch)
-        self.u.set_tx_antenna("TX/RX", a.tx_ch)
-        self.u.set_rx_antenna(a.rx_ant, a.rx_ch)
-        self.tst = self.u.get_tx_stream(_args(a.tx_ch))
-        self.rst = self.u.get_rx_stream(_args(a.rx_ch))
+        tx_args = getattr(a, "tx_args", None) or a.args
+        rx_args = getattr(a, "rx_args", None) or a.args
+        self.tu = uhd.usrp.MultiUSRP(tx_args)
+        self.tu.set_tx_rate(FS)
+        self.tu.set_tx_freq(uhd.types.TuneRequest(a.freq), a.tx_ch)
+        self.tu.set_tx_gain(a.tx_gain, a.tx_ch)
+        self.tu.set_tx_antenna("TX/RX", a.tx_ch)
+        self.tst = self.tu.get_tx_stream(_args(a.tx_ch))
 
-    def send(self, samples):
+        self.ru = self.tu if rx_args == tx_args else uhd.usrp.MultiUSRP(rx_args)
+        self.ru.set_rx_rate(FS)
+        self.ru.set_rx_freq(uhd.types.TuneRequest(a.freq), a.rx_ch)
+        self.ru.set_rx_gain(a.rx_gain, a.rx_ch)
+        self.ru.set_rx_antenna(a.rx_ant, a.rx_ch)
+        self.rst = self.ru.get_rx_stream(_args(a.rx_ch))
+        if self.ru is not self.tu:
+            print(f"two-device: tx={tx_args} rx={rx_args}", flush=True)
+
+    def send(self, samples, start=True, end=True):
         n = 0
         total = samples.size
+        stalls = 0
         while n < total:
             # 1-D buffer: pyuhd's send() with a (N,1) array runs ~20x slower
             # (per-sample fallback) and underflows the TX stream. Keep it 1-D.
             seg = samples[n:n + 2040]
             md = uhd.types.TXMetadata()
-            md.start_of_burst = (n == 0)
-            md.end_of_burst = (n + 2040 >= total)
+            md.start_of_burst = start and (n == 0)
+            md.end_of_burst = end and (n + 2040 >= total)
             sent = self.tst.send(seg, md, 1.0)
             if sent <= 0:
-                break
+                stalls += 1
+                if stalls > 10:
+                    break
+                time.sleep(0.01)
+                continue
+            stalls = 0
             n += sent
         return n
 
@@ -291,8 +416,10 @@ def run_file(a):
     data = open(a.input, "rb").read()
     tx = build_frames(data) * a.tx_amp
     # prime the TX stream: the device underflows for the first few hundred ms,
-    # which would otherwise shred the first frames
-    tx = np.concatenate([np.zeros(int(0.3 * FS), np.float32), tx]).astype(np.complex64)
+    # which would otherwise shred the first frames; then send the calibration
+    # train so the receiver can measure the two-radio CFO once up front
+    tx = np.concatenate([np.zeros(int(0.3 * FS), np.float32),
+                         cal_symbols(a.tx_amp), tx]).astype(np.complex64)
     nframes = (len(data) + PAYLOAD - 1) // PAYLOAD
     print(f"payload {len(data)} B -> {nframes} frames, "
           f"{tx.size/FS:.2f} s air time, {AIR_RATE/1e3:.1f} kB/s")
@@ -335,10 +462,14 @@ def run_file(a):
           f"tx sent {sent} samples in {tx_dt:.2f} s (air {tx.size/FS:.2f} s), "
           f"max|rx|={np.max(np.abs(rx)):.4f}")
 
+    off = calibrate(rx)
+    if off:
+        rx = rx[off:]
     got, bad, npeaks = demod_stream(rx)
     snrs = [v[1] for v in got.values()] or [0]
+    cfos = [v[3] for v in got.values()] or [0.0]
     print(f"frames decoded {len(got)}/{nframes} (crc fail at {bad} slots), "
-          f"peak SNR {np.median(snrs):.1f} dB")
+          f"peak SNR {np.median(snrs):.1f} dB, cfo {np.median(cfos):.0f} Hz")
 
     out = bytearray()
     missing = []
@@ -370,20 +501,26 @@ def run_file(a):
 def run_selftest(a):
     rng = np.random.default_rng(1)
     data = bytes(rng.integers(0, 256, 200 * PAYLOAD, dtype=np.uint8))
-    tx = build_frames(data)
+    tx = np.concatenate([np.tile(PRE_UP, CAL_PRE), build_frames(data)])
     phi = 0.7
+    cfo = 400.0                                  # non-zero CFO regression test
+    n = np.arange(tx.size, dtype=np.float64)
     for snr_db in (20, 15, 12):
         amp = 0.5
-        sig = tx * np.exp(1j * phi) * amp
+        sig = tx * np.exp(1j * (phi + 2.0 * np.pi * cfo * n / FS)) * amp
         snr_lin = 10 ** (snr_db / 10)
         sigma = np.sqrt(amp ** 2 / (2 * snr_lin))     # per-component noise std
         noise = (rng.normal(size=sig.size) + 1j * rng.normal(size=sig.size)) * sigma
         rx = (sig + noise).astype(np.complex64)
         rx = np.concatenate([np.zeros(137, np.complex64), rx])   # random timing offset
+        off = calibrate(rx)
+        if off:
+            rx = rx[off:]
         got, bad, npeaks = demod_stream(rx, log=lambda *x: None)
         ok = sum(1 for s in range(len(data) // PAYLOAD) if s in got
                  and got[s][0] == data[s * PAYLOAD:(s + 1) * PAYLOAD])
-        print(f"selftest SNR {snr_db:2d} dB: {ok}/{len(data)//PAYLOAD} frames bit-exact, "
+        print(f"selftest SNR {snr_db:2d} dB, CFO {cfo:.0f} Hz: "
+              f"{ok}/{len(data)//PAYLOAD} frames bit-exact, "
               f"crc-fail slots {bad}, peaks {npeaks}")
         if ok < len(data) // PAYLOAD * 0.99:
             print("  FAIL")
@@ -428,8 +565,7 @@ def run_live(a):
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dest = (a.udp_host, a.udp_port)
-    cmd = uhd.types.StreamCMD(uhd.types.StreamMode.num_done)
-    cmd.num_samps = total
+    cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
     cmd.stream_now = True
     link.rst.issue_stream_cmd(cmd)
 
@@ -437,12 +573,16 @@ def run_live(a):
 
     def tx_loop():
         n = 0
-        n += link.send(np.zeros(int(0.3 * FS), np.float32).astype(np.complex64))
+        # one continuous burst: SOB on the first chunk, EOB only at the very
+        # end. Breaking it into per-call bursts wedged the TX/RX streams.
+        n += link.send(np.zeros(int(0.3 * FS), np.float32).astype(np.complex64), end=False)
+        n += link.send(cal_symbols(a.tx_amp), start=False, end=False)
         p = 0
         while a.loop == 0 or p < a.loop:
             txp = (build_frames(data, seq0=p * nframes) * a.tx_amp).astype(np.complex64)
-            n += link.send(txp)
+            n += link.send(txp, start=False, end=False)
             p += 1
+        n += link.send(np.zeros(2040, np.complex64), start=False, end=True)
         sent_box["n"] = n
 
     t = threading.Thread(target=tx_loop, daemon=True)
@@ -459,15 +599,29 @@ def run_live(a):
     written = 0
     t0 = time.time()
     got_total = 0
+    cal_done = False
+    zero_runs = 0
     while got_total < total:
         md = uhd.types.RXMetadata()
         c = link.rst.recv(buf, md, 2.0)
         if a.debug:
             print(f"   recv {c} err={md.strerror()}")
         if c <= 0:
+            zero_runs += 1
+            # A B210 overflow/timeout is reported as 0 samples plus an error
+            # code, but the RX stream is still usable. Keep going while the
+            # transmitter is alive; only give up after a long silence.
+            if t.is_alive() and zero_runs < 10:
+                continue
             break
+        zero_runs = 0
         got_total += c
         window = np.concatenate([carry, buf[:c]])
+        if not cal_done:
+            off = calibrate(window)
+            if off:
+                window = window[off:]
+                cal_done = True
         frames, _, _ = demod_stream(window)
         got.update({k: v for k, v in frames.items() if k not in got})
         if not started and got:
@@ -479,6 +633,8 @@ def run_live(a):
             last_emit = time.time()
         written += sent
         carry = window[-overlap:]
+    # stop continuous RX before joining the transmitter
+    link.rst.issue_stream_cmd(uhd.types.StreamCMD(uhd.types.StreamMode.stop_cont))
     # drain
     t.join(timeout=5)
     print(f"live: {written} B forwarded, next expected seq {nxt}, "
@@ -504,7 +660,7 @@ def demod_window(rx, thresh=10.0, topk=80, sep=200):
         p = refine(rx, i, span=8)
         r = demod_at(rx, p)
         if r is not None:
-            out[r["seq"]] = (r["payload"], r["snr"], r["amp"])
+            out[r["seq"]] = _entry(r)
     return out
 
 def run_pipe(a):
@@ -515,7 +671,6 @@ def run_pipe(a):
     continuously, and the link consumes them at the same rate it sends them.
     """
     import socket
-    link = Link(a)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dest = (a.udp_host, a.udp_port)
     print(f"live pipeline: stdin -> B210 ch{a.tx_ch}/ch{a.rx_ch} @ {a.freq/1e6:.3f} MHz "
@@ -524,8 +679,8 @@ def run_pipe(a):
     buf = bytearray()
     lock = threading.Lock()
     eof = threading.Event()
-    stats = {"in": 0, "out": 0, "sent": 0, "dropped": 0}
-    max_backlog = 500 * PAYLOAD         # ~188 kB ~ 4 s; large enough for I-frame bursts
+    stats = {"in": 0, "out": 0, "sent": 0, "dropped": 0, "under": 0}
+    max_backlog = 1000 * PAYLOAD        # ~376 kB; absorbs the ~3 s UHD init
 
     def reader():
         while True:
@@ -540,10 +695,19 @@ def run_pipe(a):
                     del buf[:PAYLOAD]
                     stats["dropped"] += 1
 
+    # Start draining stdin before the UHD init: otherwise ffmpeg's first ~1 s
+    # piles up in the pipe and the backlog cap drops whole frames at startup.
+    th_r = threading.Thread(target=reader, daemon=True)
+    th_r.start()
+    link = Link(a)
+
     def tx():
         seq = 0
         first = True
-        pending = np.zeros(0, np.complex64)
+        # short prime (absorbs TX startup underflow) + CFO calibration train
+        pending = np.concatenate([
+            np.zeros(int(0.1 * FS), np.complex64),
+            cal_symbols(a.tx_amp)]).astype(np.complex64)
         while True:
             data = None
             with lock:
@@ -566,7 +730,14 @@ def run_pipe(a):
             md.end_of_burst = False
             sent = link.tst.send(pending[:n], md, 1.0)
             if sent <= 0:
-                break
+                # transient TX underflow: keep the samples and retry instead
+                # of killing the live stream
+                stats["under"] += 1
+                if stats["under"] > 10:
+                    break
+                time.sleep(0.01)
+                continue
+            stats["under"] = 0
             pending = pending[sent:]
             first = False
             stats["sent"] = seq
@@ -578,14 +749,12 @@ def run_pipe(a):
             link.tst.send(np.zeros(2040, np.complex64), md, 1.0)
         stats["done"] = True
 
-    th_r = threading.Thread(target=reader, daemon=True)
-    th_t = threading.Thread(target=tx, daemon=True)
-    th_r.start()
-    th_t.start()
-
     cmd = uhd.types.StreamCMD(uhd.types.StreamMode.start_cont)
     cmd.stream_now = True
     link.rst.issue_stream_cmd(cmd)
+
+    th_t = threading.Thread(target=tx, daemon=True)
+    th_t.start()
 
     chunk = int(0.15 * FS)
     overlap = int(0.05 * FS)
@@ -598,6 +767,7 @@ def run_pipe(a):
     last_emit = time.time()
     t0 = time.time()
     deadline = t0 + a.duration if a.duration else None
+    cal_done = False
     while True:
         if not th_t.is_alive() and not got:
             break                       # tx finished and nothing buffered
@@ -609,6 +779,11 @@ def run_pipe(a):
                 break
             continue
         window = np.concatenate([carry, cbuf[:c]])
+        if not cal_done:
+            off = calibrate(window)
+            if off:
+                window = window[off:]
+                cal_done = True
         got.update({k: v for k, v in demod_window(window).items() if k not in got})
         if not started and got:
             nxt = min(got)
@@ -627,7 +802,8 @@ def run_pipe(a):
     th_t.join(timeout=2)
     dur = time.time() - t0
     print(f"live: in {stats['in']} B, out {stats['out']} B, frames {stats['sent']}, "
-          f"dropped {stats['dropped']}, {dur:.1f} s -> {stats['out']/max(dur,1e-9)/1e3:.1f} kB/s")
+          f"dropped {stats['dropped']}, underflows {stats.get('under', 0)}, "
+          f"{dur:.1f} s -> {stats['out']/max(dur,1e-9)/1e3:.1f} kB/s")
     return 0
 
 
@@ -636,6 +812,12 @@ def main():
     ap.add_argument("mode", choices=["file", "selftest", "live", "pipe"])
     ap.add_argument("--input")
     ap.add_argument("--output")
+    ap.add_argument("--args", default=os.environ.get("SDR_ARGS", "type=b200"),
+                    help="UHD device args (e.g. type=b200,serial=206448)")
+    ap.add_argument("--tx-args", default=None,
+                    help="UHD args for the TX radio (default: --args)")
+    ap.add_argument("--rx-args", default=None,
+                    help="UHD args for the RX radio (default: --args)")
     ap.add_argument("--freq", type=float, default=915e6)
     ap.add_argument("--tx-ch", type=int, default=1)
     ap.add_argument("--rx-ch", type=int, default=1)

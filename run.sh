@@ -22,6 +22,8 @@ PORT="${PORT:-18096}"
 LOOP="${LOOP:-1}"
 START="${START:-0}"
 VIDEO="${VIDEO:-}"
+VCODEC="${VCODEC:-libx264}"
+VBITRATE="${VBITRATE:-300k}"
 CLIP=clip.ts
 
 say() { printf '\n=== %s ===\n' "$*"; }
@@ -48,7 +50,7 @@ if [ ! -f "$CLIP" ]; then
   else
     say "1. no VIDEO given — generating a synthetic 30 s source (lavfi testsrc2)"
     ffmpeg -y -hide_banner -loglevel error \
-      -f lavfi -i testsrc2=size=640x360:rate=20 \
+      -f lavfi -i testsrc2=size=480x270:rate=20 \
       -f lavfi -i sine=frequency=800:sample_rate=48000 \
       -t 30 -c:v libx264 -profile:v baseline -preset veryfast \
       -b:v 110k -maxrate 140k -bufsize 240k -g 40 -keyint_min 40 -sc_threshold 0 \
@@ -73,14 +75,12 @@ if [ "$MODE" = "cam" ]; then
   if [ -n "$VIDEO" ] && [ -f "$VIDEO" ]; then
     say "3. live pipeline: $VIDEO (1x, $VCODEC ${VBITRATE}) -> B210 -> UDP -> VLC"
     SRC=(-re -ss "$START" -i "$VIDEO")
-    VF=(-vf "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2")
+    VF=(-vf "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2")
   else
     say "3. live pipeline: synthetic camera ($VCODEC ${VBITRATE}) -> B210 -> UDP -> VLC"
-    SRC=(-re -f lavfi -i "testsrc2=size=640x360:rate=20" -f lavfi -i "sine=frequency=800:sample_rate=48000")
+    SRC=(-re -f lavfi -i "testsrc2=size=480x270:rate=20" -f lavfi -i "sine=frequency=800:sample_rate=48000")
     VF=()
   fi
-  VCODEC="${VCODEC:-libx264}"
-  VBITRATE="${VBITRATE:-600k}"
   if [ "$VCODEC" = "libx265" ]; then
     VOPT=(-c:v libx265 -preset fast -x265-params "rc-lookahead=20:bframes=0:log-level=error" -b:v "$VBITRATE")
   else
